@@ -22,7 +22,6 @@ def run_tests():
         print(f"TEST CASE #{i}")
         print(f"COMMAND: {cmd}")
         
-        # Викликаємо твою функцію валідації
         report = validate_request(cmd)
         print(report)
         print("-" * 50)

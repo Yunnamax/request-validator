@@ -1,5 +1,6 @@
 import re
 import subprocess
+import platform
 
 def parse_curl(curl_string):
     """Parses curl into parts: proxy, authentication, and target URL."""
@@ -17,7 +18,6 @@ def parse_curl(curl_string):
         parts["proxy_url"] = proxy_match.group(1)
         
     # Extract authentication (-U or --proxy-user)
-    # Looking for text between quotes or until the next space
     auth_match = re.search(r'(?:-U|--proxy-user)\s+[\'"]?([^\s\'"]+)[\'"]?', curl_string)
     if auth_match:
         parts["auth_block"] = auth_match.group(1)
@@ -37,35 +37,61 @@ def validate_request(curl_input):
     errors = []
     warnings = []
 
-    # 1. Port/Protocol Check (Error #1 and #4)
+# 1. Port/Protocol/Host Check (Error #1 and #4)
     if parts["proxy_url"]:
-        if ":65534" in parts["proxy_url"] and "https://" in parts["proxy_url"]:
-            errors.append("Port 65534 is for HTTP. Use 'http://' protocol.")
-        elif ":65535" in parts["proxy_url"] and "http://" in parts["proxy_url"]:
-            errors.append("Port 65535 is for HTTPS. Use 'https://' protocol.")
+        proxy_url = parts["proxy_url"].lower()
         
-        # Check for legacy host (Error #2)
-        if "isp.joinmassive.com" in parts["proxy_url"]:
-            warnings.append("Host 'isp.joinmassive.com' might be legacy. Use 'network.joinmassive.com'.")
+        # HTTPS Check
+        if ":65535" in proxy_url and not proxy_url.startswith("https://"):
+            errors.append("Port 65535 is for HTTPS. Your proxy URL should start with 'https://'.")
+        
+        # HTTP Check
+        elif ":65534" in proxy_url and not proxy_url.startswith("http://"):
+            # Note: curl might default to http, but explicit is better
+            errors.append("Port 65534 is for HTTP. Your proxy URL should start with 'http://'.")
+            
+        # SOCKS5 Check (Adding this from documentation)
+        elif ":65533" in proxy_url and not proxy_url.startswith("socks5://"):
+            errors.append("Port 65533 is for SOCKS5. Your proxy URL should start with 'socks5://'.")
 
-    # 2. Authentication and Geotargeting Check (Error #3 and #4)
+        # Reverse check: if protocol is used with wrong port
+        if proxy_url.startswith("https://") and ":65535" not in proxy_url:
+            warnings.append("You are using HTTPS protocol but not on the standard port 65535.")
+        
+    # 2. Check for wrong host (Error #2)
+        if "isp.joinmassive.com" in parts["proxy_url"]:
+            warnings.append("Host 'isp.joinmassive.com' is wrong host. Use 'network.joinmassive.com'.")
+
+    # 3. Authentication and Geotargeting Check (Error #3 and #4)
     if parts["auth_block"]:
-        if ":" in parts["auth_block"]:
-            username, password = parts["auth_block"].split(":", 1)
-            
-            # Check parameter placement
-            if any(key in password for key in ["-country-", "-city-", "-zipcode-"]):
-                errors.append("Geotargeting parameters must be in the Username section (before the colon).")
-            
-            # Check ISO code
-            if "-country-UK" in username:
-                warnings.append("'UK' is not a standard ISO code. Use 'GB' for United Kingdom.")
-        else:
-            errors.append("Invalid credentials format. Use 'username:password'.")
+            if ":" in parts["auth_block"]:
+                username, password = parts["auth_block"].split(":", 1)
+                username_lower = username.lower()
+                
+                # Ensure parameters are not placed in the password field
+                geo_keys = ["-country-", "-city-", "-zipcode-", "-subdivision-"]
+                if any(key in password for key in geo_keys):
+                    errors.append("Geotargeting parameters must be in the Username section (before the colon).")
+                
+                # Check for mandatory country key when other geo-parameters are present
+                has_country = "-country-" in username_lower
+                has_other_geo = any(key in username_lower for key in ["-city-", "-zipcode-", "-subdivision-"])
+                if has_other_geo and not has_country:
+                    errors.append("HTTP 400 Risk: 'country' parameter is mandatory when using city, zipcode, or subdivision.")
+
+                # Identify if city will be ignored due to zipcode priority
+                if "-zipcode-" in username_lower and "-city-" in username_lower:
+                    warnings.append("Optimization: 'city' will be ignored by the server because 'zipcode' is specified.")
+                
+                # Verify ISO country code compliance
+                if "-country-uk" in username_lower:
+                    warnings.append("'UK' is not a standard ISO code. Use 'GB' for United Kingdom.")
+            else:
+                errors.append("Invalid credentials format. Use 'username:password'.")
 
     # Final report generation
     if not errors and not warnings:
-        return "Success: Request looks valid according to Massive documentation."
+        return "Success: Request looks valid. No issues detected."
     
     report = ["\n--- Analysis Report ---"]
     for err in errors:
@@ -78,14 +104,18 @@ def validate_request(curl_input):
 def execute_curl(curl_command):
     """Executes the curl command safely using shlex to split arguments."""
     import shlex
-    try:
-        # split the string into a list of arguments correctly
-        # this handles quotes and spaces much better than shell=True
-        args = shlex.split(curl_command)
         
-        # We replace 'curl' with 'curl.exe' for Windows stability
-        if args[0] == 'curl':
-            args[0] = 'curl.exe'
+    try:
+        args = shlex.split(curl_command)
+            
+        # Check the Operating System
+        if platform.system() == "Windows":
+            if args[0] == 'curl':
+                args[0] = 'curl.exe'
+            else:
+                # On Linux/macOS, we ensure it's just 'curl'
+                if args[0] == 'curl.exe':
+                    args[0] = 'curl'
             
         process = subprocess.run(args, capture_output=True, text=True)
         
